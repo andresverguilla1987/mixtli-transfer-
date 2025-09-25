@@ -1,19 +1,14 @@
-# Mixtli Backend — R2 (v4)
+# Mixtli Backend — R2 (v5, transfers)
 
-Endpoints
-- GET  /api/health
-- GET  /api/config
-- POST /api/presign                -> URL firmada PUT a R2 (opcional)
-- POST /api/upload-direct          -> Multipart (campo `file`) sube a R2 sin OPTIONS
-- POST /api/upload-direct-raw      -> Body octet-stream sube a R2 sin OPTIONS
-- POST /api/presign-get            -> URL firmada de lectura (GET)
-- POST /api/delete                 -> Borra objeto
+Nuevos endpoints (paquetes estilo WeTransfer):
+- `POST /api/transfers` → crea paquete `{ id, prefix, expiresAt }` (por defecto 7 días, `TRANSFER_DAYS_DEFAULT`).
+- `GET /api/transfers/:id` → lista archivos dentro del paquete.
+- `GET /api/transfers/:id/zip` → descarga ZIP (streaming) con todo el paquete.
+- `POST /api/transfers/:id/delete` → borra todo el paquete.
 
-ENV requeridas
-- R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET
-- ALLOWED_ORIGINS='["https://tu-netlify","http://localhost:5173"]'
-- NODE_VERSION=20, PORT=10000, PRESIGN_EXPIRES=900
-- (opcional) REQUIRE_TOKEN=true y X_MIXTLI_TOKEN=...
+Sube archivos usando `folder = transfers/<id>` con:
+- `POST /api/upload-direct` (multipart) o
+- `POST /api/presign` + PUT (si tu bucket permite OPTIONS).
 
-Build: `npm ci --no-audit --no-fund || npm install --no-audit --no-fund`
-Start: `node server.js`
+Resto de endpoints existentes:
+- health, config, presign (PUT), upload-direct, upload-direct-raw, presign-get, delete.
