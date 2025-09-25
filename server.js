@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
 import archiver from 'archiver';
+import crypto from 'crypto';
 import {
   S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand, ListObjectsV2Command
 } from '@aws-sdk/client-s3';
@@ -29,8 +30,8 @@ const TRANSFER_DAYS_DEFAULT = Number(process.env.TRANSFER_DAYS_DEFAULT || 7);
 
 const REQUIRE_TOKEN = String(process.env.REQUIRE_TOKEN||'false').toLowerCase()==='true';
 const PRIVATE_TOKEN = process.env.X_MIXTLI_TOKEN || '';
-const PAID_TOKEN = process.env.PAID_TOKEN || ''; // si requirePaid=true, permite ?paid=PAID_TOKEN
 const PLAN_BYPASS = (process.env.PLAN_BYPASS || 'prepaid,active').split(',').map(s=>s.trim().toLowerCase()).filter(Boolean);
+const PAYMENT_SECRET = need('PAYMENT_SECRET'); // for signing paid tokens
 
 const R2 = new S3Client({
   region: R2_REGION,
@@ -56,10 +57,36 @@ function cleanFolder(s){ const x = String(s||'').replace(/^\/+|\/+$/g,'').replac
 const transferPrefix = id => `transfers/${id}/`;
 const randomId = (n=7)=>{ const s='ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; let out=''; for(let i=0;i<n;i++) out+=s[Math.floor(Math.random()*s.length)]; return out; };
 const isValidId = id => /^[A-Z2-9_\-]{5,20}$/.test(id);
+const b64url = (buf)=> Buffer.from(buf).toString('base64').replace(/=+$/,'').replace(/\+/g,'-').replace(/\//g,'_');
+const sign = (payloadObj)=>{
+  const header = b64url(JSON.stringify({alg:'HS256',typ:'JWT'}));
+  const payload = b64url(JSON.stringify(payloadObj));
+  const mac = crypto.createHmac('sha256', PAYMENT_SECRET).update(header+'.'+payload).digest('base64').replace(/=+$/,'').replace(/\+/g,'-').replace(/\//g,'_');
+  return header+'.'+payload+'.'+mac;
+};
+const verify = (token)=>{
+  try{
+    const [h,p,s] = token.split('.'); if(!h||!p||!s) return null;
+    const mac = crypto.createHmac('sha256', PAYMENT_SECRET).update(h+'.'+p).digest('base64').replace(/=+$/,'').replace(/\+/g,'-').replace(/\//g,'_');
+    if(mac!==s) return null;
+    const payload = JSON.parse(Buffer.from(p.replace(/-/g,'+').replace(/_/g,'/'),'base64').toString('utf-8'));
+    if(payload.exp && Date.now() > payload.exp) return null;
+    return payload;
+  }catch{ return null; }
+};
+
+async function loadMeta(id){
+  const cmd = new GetObjectCommand({ Bucket: R2_BUCKET, Key: `transfers/${id}/_meta.json` });
+  try{
+    const r = await R2.send(cmd);
+    const chunks=[]; for await (const c of r.Body) chunks.push(c);
+    return JSON.parse(Buffer.concat(chunks).toString('utf-8'));
+  }catch(e){ return null; }
+}
 
 // ---------- Health & Config ----------
 app.get('/api/health', (req,res)=>{ nocache(res); res.json({ok:true, ts:Date.now()}); });
-app.get('/api/config', (req,res)=>{ nocache(res); res.json({ ok:true, bucket:R2_BUCKET, accountId:R2_ACCOUNT_ID.slice(0,6)+'…', allowedOrigins:ALLOWED, expires:EXPIRES, transferDaysDefault: TRANSFER_DAYS_DEFAULT, paidToken: PAID_TOKEN? true:false, planBypass: PLAN_BYPASS }); });
+app.get('/api/config', (req,res)=>{ nocache(res); res.json({ ok:true, bucket:R2_BUCKET, accountId:R2_ACCOUNT_ID.slice(0,6)+'…', allowedOrigins:ALLOWED, expires:EXPIRES, transferDaysDefault: TRANSFER_DAYS_DEFAULT, planBypass: PLAN_BYPASS, hasPaymentSecret: !!PAYMENT_SECRET }); });
 
 // ---------- Presign PUT ----------
 app.post('/api/presign', async (req,res)=>{
@@ -110,13 +137,14 @@ app.post('/api/delete', async (req,res)=>{
 // ================= Transfers =================
 app.post('/api/transfers', async (req,res)=>{
   try{
-    let id = (req.body?.id && cleanName(req.body.id)) || randomId(7);
+    const randomId = (n=7)=>{ const s='ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; let out=''; for(let i=0;i<n;i++) out+=s[Math.floor(Math.random()*s.length)]; return out; };
+    const isValidId = id => /^[A-Z2-9_\-]{5,20}$/.test(id);
+    let id = (req.body?.id && String(req.body.id).toUpperCase()) || randomId(7);
     id = id.toUpperCase().replace(/[^A-Z0-9_\-]/g,'');
     if(!isValidId(id)) id = randomId(7);
     const days = Number(req.body?.days || TRANSFER_DAYS_DEFAULT);
     const expiresAt = Date.now() + days*24*3600*1000;
 
-    // opciones: pin (opcional) y requirePaid (boolean)
     const pin = (req.body?.pin && String(req.body.pin).slice(0,12)) || null;
     const requirePaid = Boolean(req.body?.requirePaid);
 
@@ -127,13 +155,20 @@ app.post('/api/transfers', async (req,res)=>{
   }catch(e){ console.error('transfer_create_failed', e); res.status(500).json({ ok:false, error:'transfer_create_failed' }); }
 });
 
-async function loadMeta(id){
-  const cmd = new GetObjectCommand({ Bucket: R2_BUCKET, Key: `transfers/${id}/_meta.json` });
-  try{
-    const r = await R2.send(cmd);
-    const chunks=[]; for await (const c of r.Body) chunks.push(c);
-    return JSON.parse(Buffer.concat(chunks).toString('utf-8'));
-  }catch(e){ return null; }
+async function listKeys(prefix){
+  let ContinuationToken; const keys=[];
+  while(true){
+    const r = await R2.send(new ListObjectsV2Command({ Bucket: R2_BUCKET, Prefix: prefix, ContinuationToken }));
+    (r.Contents||[]).forEach(o=>{
+      if(o.Key.endsWith('/_meta.json')) return;
+      if(o.Key === prefix) return;
+      if(o.Key.endsWith('/')) return;
+      keys.push(o.Key);
+    });
+    if(!r.IsTruncated) break;
+    ContinuationToken = r.NextContinuationToken;
+  }
+  return keys;
 }
 
 app.get('/api/transfers/:id', async (req,res)=>{
@@ -141,31 +176,45 @@ app.get('/api/transfers/:id', async (req,res)=>{
     const id = String(req.params.id).toUpperCase();
     if(!isValidId(id)) return res.status(400).json({ ok:false, error:'invalid_id' });
     const prefix = `transfers/${id}/`;
-    let ContinuationToken; const items=[];
-    while(true){
-      const r = await R2.send(new ListObjectsV2Command({ Bucket: R2_BUCKET, Prefix: prefix, ContinuationToken }));
-      (r.Contents||[]).forEach(o=>{
-        if(o.Key.endsWith('/_meta.json')) return;
-        if(o.Key === prefix) return;
-        if(o.Key.endsWith('/')) return;
-        items.push({ key:o.Key.replace(prefix,''), size:o.Size||null, lastModified:o.LastModified||null });
-      });
-      if(!r.IsTruncated) break;
-      ContinuationToken = r.NextContinuationToken;
-    }
+    const keys = await listKeys(prefix);
+    const items = keys.map(k=>({ key:k.replace(prefix,''), size:null, lastModified:null }));
     const meta = await loadMeta(id);
     nocache(res);
     res.json({ ok:true, id, prefix, items, meta });
   }catch(e){ console.error('transfer_list_failed', e); res.status(500).json({ ok:false, error:'transfer_list_failed' }); }
 });
 
-// ZIP con PIN opcional y paywall opcional
+// ---------- Payment helpers ----------
+app.post('/api/pay/create', async (req,res)=>{
+  try{
+    const { id, amount } = req.body || {};
+    if(!id || !isValidId(id)) return res.status(400).json({ ok:false, error:'invalid_id' });
+    const meta = await loadMeta(id);
+    if(!meta) return res.status(404).json({ ok:false, error:'not_found' });
+    const exp = Date.now() + 60*60*1000; // 1h
+    const token = sign({ sub:'zip', id, amount: Number(amount||0), exp });
+    nocache(res);
+    res.json({ ok:true, transferId:id, amount: Number(amount||0), token });
+  }catch(e){ console.error('pay_create_failed', e); res.status(500).json({ ok:false, error:'pay_create_failed' }); }
+});
+
+app.post('/api/pay/verify', async (req,res)=>{
+  try{
+    const { token } = req.body || {};
+    const payload = token && verify(token);
+    if(!payload) return res.status(400).json({ ok:false, error:'invalid_token' });
+    nocache(res);
+    res.json({ ok:true, payload });
+  }catch(e){ console.error('pay_verify_failed', e); res.status(500).json({ ok:false, error:'pay_verify_failed' }); }
+});
+
+// ZIP with PIN + Plan bypass + Paid token
 app.get('/api/transfers/:id/zip', async (req,res)=>{
   try{
     const id = String(req.params.id).toUpperCase();
     if(!isValidId(id)) return res.status(400).send('invalid_id');
     const meta = await loadMeta(id) || {};
-    // PIN check
+
     if(meta.pin){
       const pinHdr = req.headers['x-transfer-pin'];
       const pinQ = (req.query.pin||'').toString();
@@ -173,29 +222,16 @@ app.get('/api/transfers/:id/zip', async (req,res)=>{
         return res.status(401).json({ ok:false, error:'pin_required' });
       }
     }
-    // Paywall check: allow prepaid/active via header, else require paid token if flagged
     const userPlan = (req.headers['x-user-plan']||'').toString().toLowerCase();
-    const isBypass = !!userPlan && (process.env.PLAN_BYPASS || 'prepaid,active').toLowerCase().split(',').map(s=>s.trim()).includes(userPlan);
+    const isBypass = !!userPlan && PLAN_BYPASS.includes(userPlan);
     if(meta.requirePaid && !isBypass){
       const paid = (req.query.paid||'').toString();
-      if(!process.env.PAID_TOKEN || paid !== process.env.PAID_TOKEN){
-        return res.status(402).json({ ok:false, error:'payment_required' });
-      }
+      const payload = paid && verify(paid);
+      if(!payload || payload.id !== id){ return res.status(402).json({ ok:false, error:'payment_required' }); }
     }
 
     const prefix = `transfers/${id}/`;
-    let ContinuationToken; const keys=[];
-    while(true){
-      const r = await R2.send(new ListObjectsV2Command({ Bucket: R2_BUCKET, Prefix: prefix, ContinuationToken }));
-      (r.Contents||[]).forEach(o=>{
-        if(o.Key.endsWith('/_meta.json')) return;
-        if(o.Key === prefix) return;
-        if(o.Key.endsWith('/')) return;
-        keys.push(o.Key);
-      });
-      if(!r.IsTruncated) break;
-      ContinuationToken = r.NextContinuationToken;
-    }
+    const keys = await listKeys(prefix);
     if(keys.length===0) { nocache(res); return res.status(404).send('Transfer vacío'); }
 
     res.setHeader('Content-Type','application/zip');
@@ -214,25 +250,6 @@ app.get('/api/transfers/:id/zip', async (req,res)=>{
   }catch(e){ console.error('transfer_zip_failed', e); if(!res.headersSent) res.status(500).send('zip_failed'); }
 });
 
-app.post('/api/transfers/:id/delete', async (req,res)=>{
-  try{
-    const id = String(req.params.id).toUpperCase();
-    const prefix = `transfers/${id}/`;
-    let ContinuationToken; const keys=[];
-    while(true){
-      const r = await R2.send(new ListObjectsV2Command({ Bucket: R2_BUCKET, Prefix: prefix, ContinuationToken }));
-      (r.Contents||[]).forEach(o=> keys.push(o.Key));
-      if(!r.IsTruncated) break;
-      ContinuationToken = r.NextContinuationToken;
-    }
-    let deleted=0;
-    for(const k of keys){ await R2.send(new PutObjectCommand({Bucket:R2_BUCKET, Key:k, Body: Buffer.alloc(0)})); /* ensure exists to delete */ }
-    for(const k of keys){ await R2.send(new DeleteObjectCommand({Bucket:R2_BUCKET, Key:k})); deleted++; }
-    nocache(res);
-    res.json({ ok:true, id, deleted });
-  }catch(e){ console.error('transfer_delete_failed', e); res.status(500).json({ ok:false, error:'transfer_delete_failed' }); }
-});
-
-app.get('/', (req,res)=> res.type('text/plain').send('Mixtli R2 v5.3 — PIN + Paywall opcional (plan bypass)'));
+app.get('/', (req,res)=> res.type('text/plain').send('Mixtli R2 v5.4 — Signed paid tokens + PIN + plan bypass'));
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, ()=> console.log('Mixtli R2 v5.3 on :'+PORT));
+app.listen(PORT, ()=> console.log('Mixtli R2 v5.4 on :'+PORT));
