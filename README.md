@@ -1,14 +1,11 @@
-# Mixtli Backend — R2 (v5, transfers)
+# Mixtli Backend — R2 (v5.1)
 
-Nuevos endpoints (paquetes estilo WeTransfer):
-- `POST /api/transfers` → crea paquete `{ id, prefix, expiresAt }` (por defecto 7 días, `TRANSFER_DAYS_DEFAULT`).
-- `GET /api/transfers/:id` → lista archivos dentro del paquete.
-- `GET /api/transfers/:id/zip` → descarga ZIP (streaming) con todo el paquete.
-- `POST /api/transfers/:id/delete` → borra todo el paquete.
+Fix: ZIP vacío resuelto — el endpoint `/api/transfers/:id/zip` ahora **bufferiza cada objeto** antes de añadirlo al ZIP, evitando streams que se cierran temprano.
 
-Sube archivos usando `folder = transfers/<id>` con:
-- `POST /api/upload-direct` (multipart) o
-- `POST /api/presign` + PUT (si tu bucket permite OPTIONS).
+Endpoints de transfers:
+- `POST /api/transfers` — crea paquete `{ id, prefix, expiresAt }`
+- `GET /api/transfers/:id` — lista archivos del paquete
+- `GET /api/transfers/:id/zip` — descarga ZIP (corregido)
+- `POST /api/transfers/:id/delete` — (no incluido en 5.1; puedes usar `POST /api/delete` por archivo o te agrego el masivo si lo necesitas)
 
-Resto de endpoints existentes:
-- health, config, presign (PUT), upload-direct, upload-direct-raw, presign-get, delete.
+Resto: health, config, presign(put), upload-direct, presign-get, delete.

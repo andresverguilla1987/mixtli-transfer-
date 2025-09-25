@@ -2,8 +2,9 @@ import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
 import archiver from 'archiver';
+import { Readable } from 'stream';
 import {
-  S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand, ListObjectsV2Command, HeadObjectCommand
+  S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand, ListObjectsV2Command
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
@@ -26,18 +27,6 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '25mb' }));
 
-// ---------- Logger ----------
-app.use((req,res,next)=>{
-  const safe = {
-    origin: req.headers.origin,
-    host: req.headers.host,
-    'content-type': req.headers['content-type'],
-    'user-agent': req.headers['user-agent']
-  };
-  console.log('[REQ]', req.method, req.path, {headers: safe, query: req.query});
-  const t=Date.now(); res.on('finish',()=>console.log('[RES]', req.method, req.path, res.statusCode, (Date.now()-t)+'ms')); next();
-});
-
 // ---------- Env ----------
 function need(k){const v=process.env[k]; if(!v) throw new Error('Missing env '+k); return v;}
 const R2_ACCOUNT_ID = need('R2_ACCOUNT_ID');
@@ -51,6 +40,15 @@ const TRANSFER_DAYS_DEFAULT = Number(process.env.TRANSFER_DAYS_DEFAULT || 7);
 
 const REQUIRE_TOKEN = String(process.env.REQUIRE_TOKEN||'false').toLowerCase()==='true';
 const PRIVATE_TOKEN = process.env.X_MIXTLI_TOKEN || '';
+
+const R2 = new S3Client({
+  region: R2_REGION,
+  endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+  forcePathStyle: R2_FORCE_PATH_STYLE,
+  credentials: { accessKeyId: R2_ACCESS_KEY_ID, secretAccessKey: R2_SECRET_ACCESS_KEY }
+});
+
+// ---------- Middlewares ----------
 app.use((req,res,next)=>{
   if(!REQUIRE_TOKEN) return next();
   if(req.headers['x-mixtli-token'] !== PRIVATE_TOKEN){
@@ -59,27 +57,38 @@ app.use((req,res,next)=>{
   next();
 });
 
-// ---------- R2 Client ----------
-const R2 = new S3Client({
-  region: R2_REGION,
-  endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
-  forcePathStyle: R2_FORCE_PATH_STYLE,
-  credentials: { accessKeyId: R2_ACCESS_KEY_ID, secretAccessKey: R2_SECRET_ACCESS_KEY }
-});
-
-// ---------- Health & Config ----------
-app.get('/api/health', (req,res)=> res.json({ok:true, ts:Date.now()}));
-app.get('/api/config', (req,res)=> res.json({
-  ok:true, bucket:R2_BUCKET, accountId:R2_ACCOUNT_ID.slice(0,6)+'…',
-  allowedOrigins:ALLOWED, expires:EXPIRES, transferDaysDefault: TRANSFER_DAYS_DEFAULT
-}));
-
-// ---------- Helpers ----------
-function cleanName(s){ return String(s||'file.bin').replace(/[^a-zA-Z0-9_\-.]/g,'_').slice(0,200); }
-function cleanFolder(s){ const x = String(s||'').replace(/^\/+|\/+$/g,'').replace(/[^a-zA-Z0-9_\-/]/g,'_'); return x? x+'/' : ''; }
 const upload = multer();
 
-// ---------- Presign PUT (opcional) ----------
+// ---------- Utils ----------
+function cleanName(s){ return String(s||'file.bin').replace(/[^a-zA-Z0-9_\-.]/g,'_').slice(0,200); }
+function cleanFolder(s){ const x = String(s||'').replace(/^\/+|\/+$/g,'').replace(/[^a-zA-Z0-9_\-/]/g,'_'); return x? x+'/' : ''; }
+const transferPrefix = id => `transfers/${id}/`;
+const randomId = (n=8)=>{ const s='ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; let out=''; for(let i=0;i<n;i++) out+=s[Math.floor(Math.random()*s.length)]; return out; };
+async function listPrefix(prefix){
+  let ContinuationToken = undefined;
+  const keys = [];
+  while(true){
+    const r = await R2.send(new ListObjectsV2Command({ Bucket: R2_BUCKET, Prefix: prefix, ContinuationToken }));
+    (r.Contents||[]).forEach(o=> keys.push(o.Key));
+    if(!r.IsTruncated) break;
+    ContinuationToken = r.NextContinuationToken;
+  }
+  return keys;
+}
+async function streamToBuffer(readable){
+  return await new Promise((resolve, reject)=>{
+    const chunks=[];
+    readable.on('data', d=> chunks.push(Buffer.isBuffer(d)? d: Buffer.from(d)));
+    readable.on('end', ()=> resolve(Buffer.concat(chunks)));
+    readable.on('error', reject);
+  });
+}
+
+// ---------- Health/Config ----------
+app.get('/api/health', (req,res)=> res.json({ok:true, ts:Date.now()}));
+app.get('/api/config', (req,res)=> res.json({ ok:true, bucket:R2_BUCKET, accountId:R2_ACCOUNT_ID.slice(0,6)+'…', allowedOrigins:ALLOWED, expires:EXPIRES, transferDaysDefault: TRANSFER_DAYS_DEFAULT }));
+
+// ---------- Presign PUT ----------
 app.post('/api/presign', async (req,res)=>{
   try{
     const b=req.body||{};
@@ -104,7 +113,7 @@ app.post('/api/upload-direct', upload.single('file'), async (req,res)=>{
   }catch(e){ console.error('upload_failed', e); res.status(500).json({ok:false,error:'upload_failed'}); }
 });
 
-// ---------- Presign GET ----------
+// ---------- Presign GET & Delete ----------
 app.post('/api/presign-get', async (req,res)=>{
   try{
     const { key, expires } = req.body || {};
@@ -112,36 +121,21 @@ app.post('/api/presign-get', async (req,res)=>{
     const cmd = new GetObjectCommand({ Bucket: R2_BUCKET, Key: key });
     const url = await getSignedUrl(R2, cmd, { expiresIn: Number(expires || EXPIRES) });
     res.json({ ok:true, url, key, expiresAt: Date.now() + (Number(expires||EXPIRES)*1000) });
-  }catch(e){
-    console.error('presign_get_failed', e);
-    res.status(500).json({ ok:false, error:'presign_get_failed' });
-  }
+  }catch(e){ console.error('presign_get_failed', e); res.status(500).json({ ok:false, error:'presign_get_failed' }); }
 });
-
-// ---------- Delete ----------
 app.post('/api/delete', async (req,res)=>{
-  try{
-    const { key } = req.body || {};
-    if(!key) return res.status(400).json({ ok:false, error:'Missing key' });
+  try{ const { key } = req.body || {}; if(!key) return res.status(400).json({ ok:false, error:'Missing key' });
     await R2.send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: key }));
     res.json({ ok:true, key });
-  }catch(e){
-    console.error('delete_failed', e);
-    res.status(500).json({ ok:false, error:'delete_failed' });
-  }
+  }catch(e){ console.error('delete_failed', e); res.status(500).json({ ok:false, error:'delete_failed' }); }
 });
 
-// ================= Transfers (paquetes estilo WeTransfer) =================
-function randomId(n=8){ const s='ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; let out=''; for(let i=0;i<n;i++) out+=s[Math.floor(Math.random()*s.length)]; return out; }
-function transferPrefix(id){ return `transfers/${id}/`; }
-
-// Crear transfer
+// ---------- Transfers ----------
 app.post('/api/transfers', async (req,res)=>{
   try{
     const days = Number(req.body?.days || TRANSFER_DAYS_DEFAULT);
-    const id = cleanName(req.body?.id) || randomId(7);
+    const id = (req.body?.id && cleanName(req.body.id)) || randomId(7);
     const expiresAt = Date.now() + days*24*3600*1000;
-    // Creamos un objeto marker con metadata (JSON) para poder leer info del paquete
     const metaKey = transferPrefix(id) + '_meta.json';
     const body = Buffer.from(JSON.stringify({ id, days, expiresAt }), 'utf-8');
     await R2.send(new PutObjectCommand({ Bucket:R2_BUCKET, Key: metaKey, Body: body, ContentType: 'application/json' }));
@@ -149,86 +143,39 @@ app.post('/api/transfers', async (req,res)=>{
   }catch(e){ console.error('transfer_create_failed', e); res.status(500).json({ ok:false, error:'transfer_create_failed' }); }
 });
 
-// Listar archivos de un transfer
 app.get('/api/transfers/:id', async (req,res)=>{
   try{
     const id = cleanName(req.params.id);
     const prefix = transferPrefix(id);
-    let ContinuationToken = undefined;
-    const items = [];
-    while(true){
-      const r = await R2.send(new ListObjectsV2Command({ Bucket: R2_BUCKET, Prefix: prefix, ContinuationToken }));
-      (r.Contents||[]).forEach(o=>{
-        if(o.Key.endsWith('/_meta.json') || o.Key.endsWith('_meta.json')) return;
-        if(o.Key === prefix) return;
-        if(o.Key.endsWith('/')) return;
-        items.push({ key:o.Key.replace(prefix,''), size:o.Size, lastModified:o.LastModified });
-      });
-      if(!r.IsTruncated) break;
-      ContinuationToken = r.NextContinuationToken;
-    }
+    const keys = await listPrefix(prefix);
+    const items = keys.filter(k=> !k.endsWith('/_meta.json') && !k.endsWith('_meta.json') && !k.endsWith('/')).map(k=> ({ key:k.replace(prefix,''), size: null }));
     res.json({ ok:true, id, prefix, items });
   }catch(e){ console.error('transfer_list_failed', e); res.status(500).json({ ok:false, error:'transfer_list_failed' }); }
 });
 
-// Descargar ZIP de un transfer (streaming)
+// --- FIXED ZIP: buffer cada objeto antes de anexar a archiver ---
 app.get('/api/transfers/:id/zip', async (req,res)=>{
   try{
     const id = cleanName(req.params.id);
     const prefix = transferPrefix(id);
-    // Listar objetos
-    let ContinuationToken = undefined;
-    const keys = [];
-    while(true){
-      const r = await R2.send(new ListObjectsV2Command({ Bucket: R2_BUCKET, Prefix: prefix, ContinuationToken }));
-      (r.Contents||[]).forEach(o=>{
-        if(o.Key.endsWith('/_meta.json') || o.Key.endsWith('_meta.json')) return;
-        if(o.Key === prefix) return;
-        if(o.Key.endsWith('/')) return;
-        keys.push(o.Key);
-      });
-      if(!r.IsTruncated) break;
-      ContinuationToken = r.NextContinuationToken;
-    }
+    const keys = (await listPrefix(prefix)).filter(k=> !k.endsWith('/_meta.json') && !k.endsWith('_meta.json') && !k.endsWith('/'));
     if(keys.length===0) return res.status(404).send('Transfer vacío');
     res.setHeader('Content-Type','application/zip');
     res.setHeader('Content-Disposition', `attachment; filename="transfer_${id}.zip"`);
     const archive = archiver('zip', { zlib: { level: 9 } });
-    archive.on('error', err => { console.error('zip_error', err); res.status(500).end(); });
+    archive.on('error', err => { console.error('zip_error', err); if(!res.headersSent) res.status(500).end(); });
     archive.pipe(res);
     for(const k of keys){
       const obj = await R2.send(new GetObjectCommand({ Bucket: R2_BUCKET, Key: k }));
+      // Convierte strean a buffer para evitar vacíos si el stream se cierra antes
+      const buf = await streamToBuffer(obj.Body);
       const name = k.replace(prefix,'');
-      archive.append(obj.Body, { name });
+      archive.append(buf, { name });
     }
-    archive.finalize();
+    await archive.finalize();
   }catch(e){ console.error('transfer_zip_failed', e); if(!res.headersSent) res.status(500).send('zip_failed'); }
 });
 
-// Borrar transfer completo
-app.post('/api/transfers/:id/delete', async (req,res)=>{
-  try{
-    const id = cleanName(req.params.id);
-    const prefix = transferPrefix(id);
-    let ContinuationToken = undefined;
-    const keys = [];
-    while(true){
-      const r = await R2.send(new ListObjectsV2Command({ Bucket: R2_BUCKET, Prefix: prefix, ContinuationToken }));
-      (r.Contents||[]).forEach(o=> keys.push(o.Key));
-      if(!r.IsTruncated) break;
-      ContinuationToken = r.NextContinuationToken;
-    }
-    let deleted = 0;
-    for(const k of keys){
-      await R2.send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: k }));
-      deleted++;
-    }
-    res.json({ ok:true, id, deleted });
-  }catch(e){ console.error('transfer_delete_failed', e); res.status(500).json({ ok:false, error:'transfer_delete_failed' }); }
-});
-
-// ---------- Root ----------
-app.get('/', (req,res)=> res.type('text/plain').send('Mixtli R2 v5 — transfers ready'));
-
+app.get('/', (req,res)=> res.type('text/plain').send('Mixtli R2 v5.1 — transfers with stable ZIP'));
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, ()=> console.log('Mixtli R2 v5 on :'+PORT));
+app.listen(PORT, ()=> console.log('Mixtli R2 v5.1 on :'+PORT));
