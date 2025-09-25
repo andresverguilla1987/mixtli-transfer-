@@ -1,11 +1,32 @@
-# Mixtli Backend — R2 (v5.1)
 
-Fix: ZIP vacío resuelto — el endpoint `/api/transfers/:id/zip` ahora **bufferiza cada objeto** antes de añadirlo al ZIP, evitando streams que se cierran temprano.
+# Mixtli Backend R2 v5.5 — Short token integrado
 
-Endpoints de transfers:
-- `POST /api/transfers` — crea paquete `{ id, prefix, expiresAt }`
-- `GET /api/transfers/:id` — lista archivos del paquete
-- `GET /api/transfers/:id/zip` — descarga ZIP (corregido)
-- `POST /api/transfers/:id/delete` — (no incluido en 5.1; puedes usar `POST /api/delete` por archivo o te agrego el masivo si lo necesitas)
+Endpoints clave:
+- `GET /api/health`
+- `GET /api/config`
+- `POST /api/transfers` -> `{id}` crea paquete en memoria (`pin`, `requirePaid`)
+- `POST /api/upload-direct` (multipart) -> `folder`, `filename`, `contentType`, `file`
+- `GET /api/transfers/:id` lista archivos del paquete
+- `POST /api/pay/create` -> JWT largo (legacy)
+- `POST /api/pay/create-short` -> **token corto** `pp=<exp36>.<sig10>`
+- `GET /api/transfers/:id/zip` -> acepta `?pin=...` y (si el paquete exige pago) `?pp=...` o `?paid=...` o header `x-user-plan` (bypass)
 
-Resto: health, config, presign(put), upload-direct, presign-get, delete.
+## Variables de entorno
+```
+R2_ACCOUNT_ID=8351c372dedf0e354a3196aff085f0ae
+R2_ACCESS_KEY_ID=...
+R2_SECRET_ACCESS_KEY=...
+R2_BUCKET=mixtli
+R2_REGION=auto
+R2_FORCE_PATH_STYLE=true
+
+PAYMENT_SECRET=<hex de 32 bytes>
+PAID_SHORT_TTL=86400
+PLAN_BYPASS=prepaid,active
+PORT=10000
+```
+
+## Inicio en Render
+- Build command: `npm install`
+- Start command: `node server.js`
+
