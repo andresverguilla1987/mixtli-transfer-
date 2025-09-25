@@ -1,6 +1,6 @@
 {
   "name": "mixtli-backend-r2",
-  "version": "1.4.1",
+  "version": "1.5.3",
   "type": "module",
   "main": "server.js",
   "scripts": {
